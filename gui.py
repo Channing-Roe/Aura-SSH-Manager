@@ -255,6 +255,206 @@ class StatsSignals(QObject):
     error       = pyqtSignal(str)
 
 
+# ── ANSI escape code parser ────────────────────────────────────────────────────
+import re as _re
+
+# Matches any CSI sequence:  ESC [ ... final_byte
+# Also matches OSC:          ESC ] ... ST/BEL
+# Also matches simple ESC sequences
+_ANSI_RE = _re.compile(
+    r'\x1b'
+    r'(?:'
+    r'\[([0-9;?]*)([A-Za-z])'   # CSI  →  group 1 = params, group 2 = cmd
+    r'|'
+    r'\]([^\x07\x1b]*)[\x07]'   # OSC  →  group 3 = payload (title etc.)
+    r'|'
+    r'[()][AB012]'               # Charset designations — ignore
+    r'|'
+    r'[A-Za-z]'                  # Other ESC + letter — ignore
+    r')'
+)
+
+# Standard ANSI 16-colour palette mapped to hex
+_ANSI_COLOURS = {
+    # Normal
+    30: "#1c1c1c", 31: "#f85149", 32: "#3fb950", 33: "#e3b341",
+    34: "#58a6ff", 35: "#bc8cff", 36: "#39c5cf", 37: "#c9d1d9",
+    # Bright
+    90: "#6e7681", 91: "#ff6b6b", 92: "#56d364", 93: "#e3b341",
+    94: "#79c0ff", 95: "#d2a8ff", 96: "#76e3ea", 97: "#f0f6fc",
+    # Background normal
+    40: "#1c1c1c", 41: "#6e1c1c", 42: "#1c3a1c", 43: "#3a2d00",
+    44: "#1c2d4a", 45: "#3a1c3a", 46: "#1c3a3a", 47: "#404040",
+    # Background bright
+   100: "#6e7681",101: "#f85149",102: "#3fb950",103: "#d29922",
+   104: "#388bfd",105: "#a371f7",106: "#2188ff",107: "#8b949e",
+}
+
+
+class AnsiParser:
+    """
+    Stateful ANSI escape-sequence parser.
+    Converts a stream of terminal output into (text, QTextCharFormat) segments
+    that can be inserted into a QTextEdit with proper colours and formatting.
+    """
+
+    def __init__(self):
+        from PyQt6.QtGui import QTextCharFormat, QFont
+        self._fmt = QTextCharFormat()
+        self._reset_fmt()
+        self._bold      = False
+        self._underline = False
+        self._fg        = None   # None = default
+        self._bg        = None
+
+    def _reset_fmt(self):
+        from PyQt6.QtGui import QTextCharFormat, QFont, QColor
+        self._bold      = False
+        self._underline = False
+        self._fg        = None
+        self._bg        = None
+        self._fmt       = QTextCharFormat()
+        self._fmt.setForeground(QColor(TERMINAL_FG))
+
+    def _build_fmt(self):
+        from PyQt6.QtGui import QTextCharFormat, QFont, QColor
+        fmt = QTextCharFormat()
+        # Foreground
+        fg = self._fg or TERMINAL_FG
+        fmt.setForeground(QColor(fg))
+        # Background (only set if non-default)
+        if self._bg:
+            fmt.setBackground(QColor(self._bg))
+        # Bold
+        if self._bold:
+            fmt.setFontWeight(QFont.Weight.Bold)
+        else:
+            fmt.setFontWeight(QFont.Weight.Normal)
+        # Underline
+        fmt.setFontUnderline(self._underline)
+        self._fmt = fmt
+
+    def _apply_sgr(self, params_str: str):
+        """Process SGR (Select Graphic Rendition) — ESC[...m"""
+        if not params_str:
+            self._reset_fmt()
+            return
+        try:
+            params = [int(x) if x else 0 for x in params_str.split(";")]
+        except ValueError:
+            return
+
+        i = 0
+        while i < len(params):
+            p = params[i]
+            if p == 0:
+                self._reset_fmt()
+            elif p == 1:
+                self._bold = True
+            elif p == 2:
+                self._bold = False   # dim — treat as normal
+            elif p == 3:
+                pass                 # italic — ignore
+            elif p == 4:
+                self._underline = True
+            elif p == 22:
+                self._bold = False
+            elif p == 24:
+                self._underline = False
+            elif p == 39:
+                self._fg = None
+            elif p == 49:
+                self._bg = None
+            elif 30 <= p <= 37 or 90 <= p <= 97:
+                self._fg = _ANSI_COLOURS.get(p, TERMINAL_FG)
+            elif 40 <= p <= 47 or 100 <= p <= 107:
+                self._bg = _ANSI_COLOURS.get(p)
+            elif p == 38:
+                # 256-colour or truecolour fg
+                if i + 1 < len(params) and params[i+1] == 5 and i + 2 < len(params):
+                    self._fg = self._256_to_hex(params[i+2])
+                    i += 2
+                elif i + 1 < len(params) and params[i+1] == 2 and i + 4 < len(params):
+                    r, g, b = params[i+2], params[i+3], params[i+4]
+                    self._fg = f"#{r:02x}{g:02x}{b:02x}"
+                    i += 4
+            elif p == 48:
+                # 256-colour or truecolour bg
+                if i + 1 < len(params) and params[i+1] == 5 and i + 2 < len(params):
+                    self._bg = self._256_to_hex(params[i+2])
+                    i += 2
+                elif i + 1 < len(params) and params[i+1] == 2 and i + 4 < len(params):
+                    r, g, b = params[i+2], params[i+3], params[i+4]
+                    self._bg = f"#{r:02x}{g:02x}{b:02x}"
+                    i += 4
+            i += 1
+        self._build_fmt()
+
+    @staticmethod
+    def _256_to_hex(n: int) -> str:
+        """Convert xterm 256-colour index to #rrggbb."""
+        if n < 16:
+            return _ANSI_COLOURS.get(n + 30, TERMINAL_FG)
+        if 16 <= n <= 231:
+            n -= 16
+            b = n % 6;  n //= 6
+            g = n % 6;  r = n // 6
+            def c(x): return 0 if x == 0 else 55 + x * 40
+            return f"#{c(r):02x}{c(g):02x}{c(b):02x}"
+        # Greyscale 232-255
+        v = 8 + (n - 232) * 10
+        return f"#{v:02x}{v:02x}{v:02x}"
+
+    def parse(self, raw: str) -> list[tuple[str, object]]:
+        """
+        Parse raw terminal output into list of (text, QTextCharFormat) tuples.
+        Strips non-printable control sequences that don't affect colour/formatting.
+        """
+        segments = []
+        pos = 0
+
+        for m in _ANSI_RE.finditer(raw):
+            # Text before this escape sequence
+            if m.start() > pos:
+                chunk = raw[pos:m.start()]
+                chunk = self._clean(chunk)
+                if chunk:
+                    segments.append((chunk, self._fmt))
+
+            csi_params = m.group(1)
+            csi_cmd    = m.group(2)
+            # osc_payload = m.group(3)  — title changes, ignored
+
+            if csi_cmd == "m":
+                # SGR — colour/formatting
+                self._apply_sgr(csi_params or "")
+            # All other CSI commands (cursor movement, erase, etc.) are silently dropped
+
+            pos = m.end()
+
+        # Remaining text after last escape
+        if pos < len(raw):
+            chunk = self._clean(raw[pos:])
+            if chunk:
+                segments.append((chunk, self._fmt))
+
+        return segments
+
+    @staticmethod
+    def _clean(text: str) -> str:
+        """Remove residual non-printable bytes that aren't \r or \n."""
+        # Keep printable + \r + \n + \t
+        result = []
+        for ch in text:
+            cp = ord(ch)
+            if cp == 0x0d or cp == 0x0a or cp == 0x09:
+                result.append(ch)
+            elif cp >= 0x20:
+                result.append(ch)
+            # else: drop (BEL, BS, raw ESC remnants, etc.)
+        return "".join(result)
+
+
 # ── Terminal widget ─────────────────────────────────────────────────────────────
 class TerminalWidget(QWidget):
     """
@@ -265,6 +465,7 @@ class TerminalWidget(QWidget):
         super().__init__(parent)
         self.session = session
         self.signals = TerminalSignals()
+        self._ansi = AnsiParser()   # stateful ANSI parser
         self._setup_ui()
         self._start_shell()
 
@@ -359,12 +560,17 @@ class TerminalWidget(QWidget):
     def _append_output(self, text: str):
         cursor = self.output.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
-        cursor.insertText(text)
+        # Parse ANSI escape sequences into coloured segments
+        for chunk, fmt in self._ansi.parse(text):
+            # Normalise \r\n and lone \r to newlines
+            chunk = chunk.replace("\r\n", "\n").replace("\r", "\n")
+            cursor.insertText(chunk, fmt)
         self.output.setTextCursor(cursor)
         self.output.ensureCursorVisible()
 
     def _clear_output(self):
         self.output.clear()
+        self._ansi = AnsiParser()   # reset colour state
 
     def _on_connected(self):
         self.lbl_status.setText("● Connected")
