@@ -1,0 +1,13 @@
+# Aura SSH Manager — Python dependencies
+# Install with:  pip install -r requirements.txt
+
+# ── Core app (local machine) ──────────────────────────────────────────────────
+PyQt6>=6.6.0
+paramiko>=3.4.0
+cryptography>=42.0.0
+
+# ── Remote agent (install on the REMOTE machine, not here) ───────────────────
+# Copy remote_agent.py to the remote machine and run:
+#   pip install mss pillow
+# mss>=9.0.1
+# pillow>=10.0.0
